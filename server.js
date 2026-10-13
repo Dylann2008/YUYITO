@@ -1,0 +1,1608 @@
+import express from 'express';
+import session from 'express-session';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import store from './src/store.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = 3000;
+
+// Trust reverse proxy (Google Cloud Run / Nginx / AI Studio)
+app.set('trust proxy', 1);
+
+// Middleware
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Intercept Set-Cookie header to append ; Partitioned on HTTPS (CHIPS standard for iframes)
+app.use((req, res, next) => {
+  const prevSetHeader = res.setHeader;
+  res.setHeader = function (name, value) {
+    if (typeof name === 'string' && name.toLowerCase() === 'set-cookie') {
+      const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+      if (isHttps) {
+        if (Array.isArray(value)) {
+          value = value.map(cookie => {
+            if (typeof cookie === 'string' && cookie.includes('SameSite=None') && !cookie.includes('Partitioned')) {
+              return `${cookie}; Partitioned`;
+            }
+            return cookie;
+          });
+        } else if (typeof value === 'string' && value.includes('SameSite=None') && !value.includes('Partitioned')) {
+          value = `${value}; Partitioned`;
+        }
+      }
+    }
+    return prevSetHeader.apply(this, arguments);
+  };
+  next();
+});
+
+// Configure session with explicit MemoryStore to persist across requests
+const sessionStore = new session.MemoryStore();
+
+const sessionMiddleware = session({
+  store: sessionStore,
+  secret: process.env.SESSION_SECRET || 'agendex-liceo-secret-2024',
+  resave: false,
+  saveUninitialized: false,
+  proxy: true,
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000,
+    httpOnly: true
+  }
+});
+
+app.use(sessionMiddleware);
+
+// Dynamically adjust cookie security for HTTPS / iframes vs localhost HTTP
+app.use((req, res, next) => {
+  if (req.session && req.session.cookie) {
+    const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    if (isHttps) {
+      req.session.cookie.secure = true;
+      req.session.cookie.sameSite = 'none';
+    } else {
+      req.session.cookie.secure = false;
+      req.session.cookie.sameSite = 'lax';
+    }
+  }
+  next();
+});
+
+// View engine
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'ejs');
+
+// Custom flash & user context middleware
+app.use((req, res, next) => {
+  if (!req.session.flash) {
+    req.session.flash = [];
+  }
+  
+  const flashList = (req.session.flash || []).map(f => ({
+    category: f.categoria || f.category || 'info',
+    categoria: f.categoria || f.category || 'info',
+    message: f.texto || f.message || '',
+    texto: f.texto || f.message || ''
+  }));
+  res.locals.current_user = req.session.user || null;
+  res.locals.messages = flashList;
+  res.locals.mensajes = flashList;
+  res.locals.ROLES = {
+    utp: 'UTP / Directivo',
+    profe: 'Profesor',
+    inspe: 'Inspectoría',
+    alumno: 'Alumno'
+  };
+  req.session.flash = []; // clear after reading
+
+  const d = new Date();
+  const options = { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' };
+  res.locals.today_formatted = d.toLocaleDateString('es-CL', options);
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const todayStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  res.locals.today_str = todayStr;
+  res.locals.hoy = todayStr;
+
+  // Sistema de Notificaciones dinámicas según rol y usuario
+  const notificaciones = [];
+  if (req.session.user) {
+    const u = req.session.user;
+    if (u.rol === 'alumno') {
+      const aId = u.alumno_id || (store.alumnos.find(a => a.rut === u.rut)?.id) || 1;
+      if (aId) {
+        // 1. Notificaciones de pruebas recuperativas asignadas
+        const recs = store.getRecuperacionesByAlumno(aId).filter(r => r.estado === 'pendiente');
+        recs.forEach(r => {
+          const ev = r.evaluacion || store.getEvaluacion(r.evaluacion_id);
+          const asig = ev && ev.asignatura ? ev.asignatura.nombre : 'Asignatura';
+          const prof = ev && ev.profesor ? ev.profesor.nombre_completo : 'Docente';
+          const isToday = r.fecha_recuperacion === todayStr;
+          const isTomorrow = (() => {
+            const tm = new Date();
+            tm.setDate(tm.getDate() + 1);
+            return r.fecha_recuperacion === `${tm.getFullYear()}-${pad(tm.getMonth() + 1)}-${pad(tm.getDate())}`;
+          })();
+
+          let urgencia = 'warning';
+          let timeBadge = `Rinde el ${r.fecha_recuperacion}`;
+          if (isToday) {
+            urgencia = 'danger';
+            timeBadge = '¡RINDE HOY!';
+          } else if (isTomorrow) {
+            urgencia = 'warning';
+            timeBadge = 'Rinde Mañana';
+          }
+
+          notificaciones.push({
+            id: `rec-${r.id}`,
+            tipo: 'recuperacion',
+            urgencia,
+            titulo: `Prueba Recuperativa: ${asig}`,
+            detalle: `Citación fijada para el ${r.fecha_recuperacion} con ${prof}. Exigencia reglamentaria: ${Math.round(r.porcentaje_exigencia)}%.`,
+            tiempo: timeBadge,
+            link: '/recuperaciones',
+            icono: 'bi-bell-fill'
+          });
+        });
+
+        // 2. Notificaciones de inasistencias registradas sin justificar
+        const asists = store.getAsistenciasByAlumno(aId);
+        const inasistenciasSinJust = asists.filter(a => a.estado_asistencia === 'injustificada');
+        inasistenciasSinJust.forEach(a => {
+          const ev = store.getEvaluacion(a.evaluacion_id);
+          const asig = ev && ev.asignatura ? ev.asignatura.nombre : 'Evaluación';
+          notificaciones.push({
+            id: `asist-${a.id}`,
+            tipo: 'inasistencia',
+            urgencia: 'warning',
+            titulo: `Inasistencia Registrada: ${asig}`,
+            detalle: `Evaluación regular del ${ev ? ev.fecha : 'fecha pasada'}. Presenta tu certificado médico en Inspectoría General para regularizar exigencia al 60%.`,
+            tiempo: 'Justificación Pendiente',
+            link: '/',
+            icono: 'bi-exclamation-triangle-fill'
+          });
+        });
+      }
+    } else if (u.rol === 'profe') {
+      const pId = u.profesor_id;
+      const evalsHoy = store.evaluaciones.filter(e => {
+        if (e.fecha !== todayStr) return false;
+        if (pId && e.profesor_id !== pId) return false;
+        return !e.asistencia_guardada;
+      });
+      evalsHoy.forEach(e => {
+        const enriched = store.getEvaluacion(e.id);
+        notificaciones.push({
+          id: `eval-asist-${e.id}`,
+          tipo: 'asistencia_pendiente',
+          urgencia: 'primary',
+          titulo: `Pase de lista pendiente: ${e.titulo}`,
+          detalle: `Evaluación programada para hoy en curso ${enriched.curso ? enriched.curso.nombre : ''}. Recuerda pasar lista.`,
+          tiempo: 'Hoy',
+          link: `/evaluaciones/${e.id}`,
+          icono: 'bi-clipboard-check'
+        });
+      });
+    } else if (u.rol === 'inspe') {
+      const asistInjust = store.asistencias.filter(a => a.estado_asistencia === 'injustificada');
+      if (asistInjust.length > 0) {
+        notificaciones.push({
+          id: 'inspe-inasist',
+          tipo: 'justificaciones',
+          urgencia: 'warning',
+          titulo: `${asistInjust.length} inasistencia(s) por justificar`,
+          detalle: 'Hay inasistencias a evaluaciones pendientes de verificación médica o salida pedagógica.',
+          tiempo: 'Pendiente',
+          link: '/evaluaciones',
+          icono: 'bi-shield-check'
+        });
+      }
+    }
+  }
+  res.locals.notificaciones_usuario = notificaciones;
+  res.locals.notificaciones_count = notificaciones.length;
+
+  req.flash = (categoria, texto) => {
+    if (!req.session.flash) req.session.flash = [];
+    req.session.flash.push({
+      categoria,
+      texto,
+      category: categoria,
+      message: texto
+    });
+  };
+
+  next();
+});
+
+// Auth Guard
+function requireAuth(req, res, next) {
+  if (!req.session.user) {
+    return res.redirect('/login');
+  }
+  next();
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.session.user) {
+      return res.redirect('/login');
+    }
+    if (!roles.includes(req.session.user.rol)) {
+      req.flash('danger', 'No tienes permisos para acceder a esta sección.');
+      return res.redirect('/');
+    }
+    next();
+  };
+}
+
+// -------------------------------------------------------------
+// AUTH ROUTES
+// -------------------------------------------------------------
+const renderLogin = (req, res) => {
+  if (req.session.user) {
+    return res.redirect('/');
+  }
+  res.render('login', { title: 'Iniciar Sesión', error: null, correo: '' });
+};
+
+const handleLogin = (req, res) => {
+  const { correo, password } = req.body;
+  const user = store.getUsuarioByCorreo(correo);
+
+  if (!user || (user.password_hash !== password && user.clave !== password)) {
+    return res.render('login', {
+      title: 'Iniciar Sesión',
+      error: 'Correo o contraseña incorrectos.',
+      correo: correo || ''
+    });
+  }
+
+  if (!user.activo) {
+    return res.render('login', {
+      title: 'Iniciar Sesión',
+      error: 'Esta cuenta está desactivada por administración.',
+      correo: correo || ''
+    });
+  }
+
+  req.session.user = {
+    rut: user.rut,
+    correo: user.correo,
+    nombre: user.nombre,
+    rol: user.rol,
+    profesor_id: user.profesor_id || null,
+    alumno_id: user.alumno_id || null
+  };
+
+  req.flash('success', `¡Bienvenido(a) de nuevo, ${user.nombre}!`);
+  req.session.save((err) => {
+    if (err) {
+      console.error('Error guardando sesión:', err);
+    }
+    res.redirect('/');
+  });
+};
+
+const handleLogout = (req, res) => {
+  req.session.destroy((err) => {
+    res.clearCookie('connect.sid');
+    res.redirect('/login');
+  });
+};
+
+const handleDemoLogin = (req, res) => {
+  const { rol } = req.params;
+  let correo = 'inspe.diaz@liceorbl.cl';
+  if (rol === 'utp') correo = 'utp@liceorbl.cl';
+  else if (rol === 'profe' || rol === 'profesor' || rol === 'marcela') correo = 'marcela.rubio@liceorbl.cl';
+  else if (rol === 'antonio') correo = 'antonio.velasquez@liceorbl.cl';
+  else if (rol === 'inspe' || rol === 'inspectoria') correo = 'inspe.diaz@liceorbl.cl';
+  else if (rol === 'alumno') correo = 'joaquin.rivas@liceorbl.cl';
+
+  const user = store.getUsuarioByCorreo(correo);
+  if (!user) {
+    return res.redirect('/login');
+  }
+
+  req.session.user = {
+    rut: user.rut,
+    correo: user.correo,
+    nombre: user.nombre,
+    rol: user.rol,
+    profesor_id: user.profesor_id || null,
+    alumno_id: user.alumno_id || null
+  };
+
+  req.flash('success', `Acceso rápido de prueba iniciado como ${user.nombre} (${user.rol.toUpperCase()})`);
+  req.session.save((err) => {
+    res.redirect('/');
+  });
+};
+
+app.get('/login', renderLogin);
+app.get('/auth/login', renderLogin);
+app.post('/login', handleLogin);
+app.post('/auth/login', handleLogin);
+app.get('/auth/demo/:rol', handleDemoLogin);
+app.all('/logout', handleLogout);
+app.all('/auth/logout', handleLogout);
+
+// -------------------------------------------------------------
+// DASHBOARD (INICIO)
+// -------------------------------------------------------------
+app.get('/', requireAuth, (req, res) => {
+  const user = req.session.user;
+  const hoy = new Date().toISOString().split('T')[0];
+
+  if (user.rol === 'alumno') {
+    // Alumno dashboard
+    let alumno = null;
+    if (user.alumno_id) {
+      alumno = store.getAlumnoById(user.alumno_id);
+    }
+    if (!alumno) {
+      alumno = store.getAlumnoByRut(user.rut) || store.alumnos[0];
+    }
+
+    const evalsCurso = alumno ? store.evaluaciones.filter(e => e.curso_id === alumno.curso_id) : [];
+    const misEvals = evalsCurso
+      .map(e => store.getEvaluacion(e.id))
+      .sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+    const evalsSemana = misEvals.filter(e => {
+      if (e.fecha < hoy) return false;
+      const diff = (new Date(e.fecha) - new Date(hoy)) / (1000 * 60 * 60 * 24);
+      return diff <= 7;
+    });
+
+    const misAsistencias = alumno ? store.getAsistenciasByAlumno(alumno.id) : [];
+    const inasistencias = misAsistencias
+      .filter(a => a.estado_asistencia !== 'presente')
+      .map(a => {
+        const ev = store.getEvaluacion(a.evaluacion_id);
+        return {
+          ...a,
+          eval_titulo: ev ? ev.titulo : 'Evaluación',
+          eval_fecha: ev ? ev.fecha : '',
+          asignatura: ev ? ev.asignatura : { nombre: 'General', color: '#14213D' }
+        };
+      });
+
+    const recsAl = (alumno ? store.getRecuperacionesByAlumno(alumno.id) : []).map(r => {
+      let aviso_tiempo = '';
+      let aviso_clase = 'primary';
+      if (r.fecha_recuperacion === hoy) {
+        aviso_tiempo = '¡Rinde Hoy!';
+        aviso_clase = 'danger';
+      } else if (r.fecha_recuperacion > hoy) {
+        const diffDays = Math.round((new Date(r.fecha_recuperacion) - new Date(hoy)) / (1000 * 60 * 60 * 24));
+        if (diffDays === 1) {
+          aviso_tiempo = 'Rinde Mañana';
+          aviso_clase = 'warning text-dark';
+        } else {
+          aviso_tiempo = `En ${diffDays} días`;
+          aviso_clase = 'primary';
+        }
+      } else {
+        aviso_tiempo = 'Fecha cumplida';
+        aviso_clase = 'secondary';
+      }
+      return {
+        ...r,
+        aviso_tiempo,
+        aviso_clase
+      };
+    });
+    const recsPendientes = recsAl.filter(r => r.estado === 'pendiente');
+
+    return res.render('index_alumno', {
+      title: 'Inicio - Alumno',
+      active: 'dashboard',
+      alumno,
+      stats: {
+        total_evaluaciones: misEvals.length,
+        evals_semana: evalsSemana.length,
+        recuperaciones_pendientes: recsPendientes.length
+      },
+      mis_evals: misEvals,
+      today: hoy,
+      mis_recuperaciones: recsAl,
+      recuperaciones_pendientes: recsPendientes,
+      inasistencias,
+      mis_asistencias: misAsistencias
+    });
+  }
+
+  // Non-alumno dashboard (UTP, Profesor, Inspectoría)
+  let baseEvals = store.evaluaciones;
+  let baseRecs = store.recuperaciones;
+  let cursosVisibles = store.cursos;
+
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    baseEvals = store.getEvaluacionesByProfesor(req.session.user.profesor_id);
+    baseRecs = store.getRecuperacionesByProfesor(req.session.user.profesor_id);
+    const profObj = store.getProfesor(req.session.user.profesor_id);
+    if (profObj && profObj.cursos_asignados && profObj.cursos_asignados.length > 0) {
+      cursosVisibles = store.cursos.filter(c => profObj.cursos_asignados.includes(c.id));
+    }
+  }
+
+  const evalsHoy = baseEvals
+    .filter(e => e.fecha === hoy)
+    .map(e => store.getEvaluacion(e.id));
+
+  const evalsSemana = baseEvals
+    .filter(e => {
+      if (e.fecha < hoy) return false;
+      const diff = (new Date(e.fecha) - new Date(hoy)) / (1000 * 60 * 60 * 24);
+      return diff <= 7;
+    })
+    .map(e => store.getEvaluacion(e.id));
+
+  const recsPendientes = baseRecs
+    .filter(r => r.estado === 'pendiente')
+    .map(r => store.enrichRecuperacion(r));
+
+  // Count by course
+  const evalsPorCurso = cursosVisibles.map(c => {
+    const count = baseEvals.filter(e => e.curso_id === c.id).length;
+    return {
+      curso_nombre: c.nombre,
+      count
+    };
+  }).filter(x => x.count > 0).sort((a, b) => b.count - a.count);
+
+  res.render('dashboard', {
+    title: 'Panel de Control',
+    active: 'dashboard',
+    evals_hoy: evalsHoy,
+    evals_semana: evalsSemana,
+    recuperaciones_pendientes: recsPendientes,
+    total_cursos: cursosVisibles.length,
+    evals_por_curso: evalsPorCurso,
+    total_evaluaciones_activas: baseEvals.length,
+    total_alumnos: store.alumnos.length,
+    hoy
+  });
+});
+
+// -------------------------------------------------------------
+// EVALUACIONES
+// -------------------------------------------------------------
+app.get('/evaluaciones', requireAuth, (req, res) => {
+  const { fecha_desde, fecha_hasta, curso_id, asignatura_id } = req.query;
+  let cursosFiltro = store.cursos;
+  let asignaturasFiltro = store.asignaturas;
+  let rawList = store.evaluaciones;
+
+  // Si el usuario es un profesor, solo ve las evaluaciones de sus cursos y asignaturas asignadas
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    rawList = store.getEvaluacionesByProfesor(req.session.user.profesor_id);
+    const profObj = store.getProfesor(req.session.user.profesor_id);
+    if (profObj) {
+      if (profObj.cursos_asignados && profObj.cursos_asignados.length > 0) {
+        cursosFiltro = store.cursos.filter(c => profObj.cursos_asignados.includes(c.id));
+      }
+      if (profObj.asignaturas_asignadas && profObj.asignaturas_asignadas.length > 0) {
+        asignaturasFiltro = store.asignaturas.filter(a => profObj.asignaturas_asignadas.includes(a.id));
+      }
+    }
+  }
+
+  let list = rawList.map(e => store.getEvaluacion(e.id));
+
+  // Si el usuario es un alumno, solo ve las pruebas de su curso
+  if (req.session.user.rol === 'alumno') {
+    const alumnoObj = req.session.user.alumno_id ? store.getAlumno(req.session.user.alumno_id) : null;
+    if (alumnoObj && alumnoObj.curso_id) {
+      list = list.filter(e => e.curso_id === alumnoObj.curso_id);
+    }
+  }
+
+  if (fecha_desde) list = list.filter(e => e.fecha >= fecha_desde);
+  if (fecha_hasta) list = list.filter(e => e.fecha <= fecha_hasta);
+  if (curso_id) list = list.filter(e => e.curso_id === Number(curso_id));
+  if (asignatura_id) list = list.filter(e => e.asignatura_id === Number(asignatura_id));
+
+  // Si el usuario es Inspectoría, solo debe ver evaluaciones donde existan alumnos con inasistencia
+  if (req.session.user.rol === 'inspe') {
+    list = list.filter(e => {
+      const asistenciasEv = store.getAsistenciasByEvaluacion(e.id);
+      return asistenciasEv.some(a => {
+        if (a.estado_asistencia) return a.estado_asistencia !== 'presente';
+        return !a.presente;
+      });
+    });
+  }
+
+  // Sort descending by date
+  list.sort((a, b) => b.fecha.localeCompare(a.fecha));
+
+  res.render('evaluaciones/listar', {
+    title: req.session.user.rol === 'alumno' ? 'Mis Evaluaciones' : 'Evaluaciones',
+    active: 'evaluaciones',
+    evaluaciones: list,
+    cursos: cursosFiltro,
+    asignaturas: asignaturasFiltro,
+    filtros: { fecha_desde, fecha_hasta, curso_id, asignatura_id }
+  });
+});
+
+// API Check availability (Enforces max 2 evaluations per course per day)
+app.get('/evaluaciones/api/disponibilidad', requireAuth, (req, res) => {
+  const curso_id = Number(req.query.curso_id);
+  const fecha = req.query.fecha;
+
+  if (!curso_id || !fecha) {
+    return res.status(400).json({ error: 'curso_id y fecha requeridos' });
+  }
+
+  const existentes = store.contarEnFecha(curso_id, fecha);
+  const evals = store.evaluaciones.filter(e => e.curso_id === curso_id && e.fecha === fecha);
+
+  res.json({
+    curso_id,
+    fecha,
+    existentes,
+    disponibles: Math.max(0, 2 - existentes),
+    evaluaciones: evals
+  });
+});
+
+app.get('/evaluaciones/crear', requireAuth, requireRole('profe', 'utp'), (req, res) => {
+  const user = req.session.user;
+  let miProfesor = store.profesores.find(p => p.id === user.profesor_id);
+  if (!miProfesor) {
+    miProfesor = store.profesores[0] || { nombre_completo: user.nombre, id: 1 };
+  }
+
+  const hoy = new Date().toISOString().split('T')[0];
+
+  // Si es profesor (no UTP), filtrar sus cursos y asignaturas asignadas
+  let cursosDisponibles = store.cursos;
+  let asignaturasDisponibles = store.asignaturas;
+
+  if (user.rol === 'profe' && miProfesor) {
+    if (miProfesor.cursos_asignados && miProfesor.cursos_asignados.length > 0) {
+      cursosDisponibles = store.cursos.filter(c => miProfesor.cursos_asignados.includes(c.id));
+    }
+    if (miProfesor.asignaturas_asignadas && miProfesor.asignaturas_asignadas.length > 0) {
+      asignaturasDisponibles = store.asignaturas.filter(a => miProfesor.asignaturas_asignadas.includes(a.id));
+    }
+  }
+
+  res.render('evaluaciones/crear', {
+    title: 'Nueva Evaluación',
+    active: 'evaluaciones',
+    cursos: cursosDisponibles,
+    asignaturas: asignaturasDisponibles,
+    mi_profesor: miProfesor,
+    hoy
+  });
+});
+
+app.post('/evaluaciones/crear', requireAuth, requireRole('profe', 'utp'), (req, res) => {
+  const user = req.session.user;
+  const { titulo, fecha, hora, curso_id, asignatura_id, descripcion } = req.body;
+  const cid = Number(curso_id);
+  const aid = Number(asignatura_id);
+
+  // Business Rule: Validate availability (Max 2 evaluations per course per day)
+  if (!store.hayLugar(cid, fecha)) {
+    req.flash('danger', 'No se puede crear la evaluación: El curso seleccionado ya tiene 2 evaluaciones asignadas para esa fecha (límite máximo diario alcanzado).');
+    return res.redirect('/evaluaciones/crear');
+  }
+
+  let profId = user.profesor_id;
+  if (!profId) {
+    profId = store.profesores[0]?.id || 1;
+  }
+
+  const ev = store.crearEvaluacion({
+    titulo,
+    fecha,
+    hora: hora || null,
+    curso_id: cid,
+    asignatura_id: aid,
+    profesor_id: profId,
+    descripcion: descripcion || ''
+  });
+
+  req.flash('success', `Evaluación "${ev.titulo}" agendada exitosamente.`);
+  res.redirect(`/evaluaciones/${ev.id}`);
+});
+
+app.get('/evaluaciones/:id', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const ev = store.getEvaluacionById(id);
+
+  if (!ev) {
+    req.flash('danger', 'Evaluación no encontrada.');
+    return res.redirect('/evaluaciones');
+  }
+
+  const alumnos = store.getAlumnosByCurso(ev.curso_id);
+  const asistenciasMap = {};
+  const asistList = store.getAsistenciasByEvaluacion(ev.id);
+  asistList.forEach(a => {
+    asistenciasMap[a.alumno_id] = a;
+  });
+
+  res.render('evaluaciones/detalle', {
+    title: ev.titulo,
+    active: 'evaluaciones',
+    ev,
+    alumnos,
+    asistencias: asistenciasMap
+  });
+});
+
+app.get('/evaluaciones/:id/editar', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const ev = store.getEvaluacionById(id);
+
+  if (!ev) {
+    req.flash('danger', 'Evaluación no encontrada.');
+    return res.redirect('/evaluaciones');
+  }
+
+  // Check permission
+  const user = req.session.user;
+  if (user.rol !== 'utp' && !(user.rol === 'profe' && user.profesor_id === ev.profesor_id)) {
+    req.flash('danger', 'No tienes permisos para editar esta evaluación.');
+    return res.redirect(`/evaluaciones/${id}`);
+  }
+
+  // Si es profesor, filtrar cursos y asignaturas que le pertenecen
+  let cursosDisponibles = store.cursos;
+  let asignaturasDisponibles = store.asignaturas;
+
+  if (user.rol === 'profe' && user.profesor_id) {
+    const profObj = store.getProfesor(user.profesor_id);
+    if (profObj) {
+      if (profObj.cursos_asignados && profObj.cursos_asignados.length > 0) {
+        cursosDisponibles = store.cursos.filter(c => profObj.cursos_asignados.includes(c.id));
+      }
+      if (profObj.asignaturas_asignadas && profObj.asignaturas_asignadas.length > 0) {
+        asignaturasDisponibles = store.asignaturas.filter(a => profObj.asignaturas_asignadas.includes(a.id));
+      }
+    }
+  }
+
+  res.render('evaluaciones/editar', {
+    title: `Editar - ${ev.titulo}`,
+    active: 'evaluaciones',
+    ev,
+    cursos: cursosDisponibles,
+    asignaturas: asignaturasDisponibles
+  });
+});
+
+app.post('/evaluaciones/:id/editar', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const ev = store.getEvaluacionById(id);
+
+  if (!ev) {
+    req.flash('danger', 'Evaluación no encontrada.');
+    return res.redirect('/evaluaciones');
+  }
+
+  const user = req.session.user;
+  if (user.rol !== 'utp' && !(user.rol === 'profe' && user.profesor_id === ev.profesor_id)) {
+    req.flash('danger', 'No tienes permisos para editar esta evaluación.');
+    return res.redirect(`/evaluaciones/${id}`);
+  }
+
+  const { titulo, fecha, hora, curso_id, asignatura_id, descripcion } = req.body;
+  const cid = Number(curso_id);
+  const aid = Number(asignatura_id);
+
+  // If date or course changed, verify limit
+  if (ev.fecha !== fecha || ev.curso_id !== cid) {
+    const existingOther = store.evaluaciones.filter(e => e.id !== id && e.curso_id === cid && e.fecha === fecha).length;
+    if (existingOther >= 2) {
+      req.flash('danger', 'No hay cupos disponibles en esa fecha para el curso (máximo 2 evaluaciones por día).');
+      return res.redirect(`/evaluaciones/${id}/editar`);
+    }
+  }
+
+  store.actualizarEvaluacion(id, {
+    titulo,
+    fecha,
+    hora: hora || null,
+    curso_id: cid,
+    asignatura_id: aid,
+    descripcion: descripcion || ''
+  });
+
+  req.flash('success', 'Evaluación actualizada correctamente.');
+  res.redirect(`/evaluaciones/${id}`);
+});
+
+app.post('/evaluaciones/:id/eliminar', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const ev = store.getEvaluacionById(id);
+
+  if (ev) {
+    const user = req.session.user;
+    if (user.rol === 'utp' || (user.rol === 'profe' && user.profesor_id === ev.profesor_id)) {
+      store.eliminarEvaluacion(id);
+      req.flash('success', 'Evaluación eliminada correctamente.');
+    } else {
+      req.flash('danger', 'No tienes permiso para eliminar esta evaluación.');
+    }
+  }
+
+  res.redirect('/evaluaciones');
+});
+
+// Redirigir GET de asistencia a la vista principal de la evaluación
+app.get('/evaluaciones/:id/asistencia', requireAuth, (req, res) => {
+  res.redirect(`/evaluaciones/${req.params.id}`);
+});
+
+// Guardar Asistencia
+app.post('/evaluaciones/:id/asistencia', requireAuth, requireRole('profe', 'utp', 'inspe'), (req, res) => {
+  try {
+    const evalId = Number(req.params.id);
+    const ev = store.getEvaluacionById(evalId);
+
+    if (!ev) {
+      req.flash('danger', 'Evaluación no encontrada.');
+      return res.redirect('/evaluaciones');
+    }
+
+    const user = req.session.user;
+    const isInspector = (user.rol === 'inspe');
+    const isProfesor = (user.rol === 'profe');
+
+    // Si la asistencia ya está guardada y bloqueada:
+    // Un profesor ya no puede volver a cambiar la asistencia una vez guardada.
+    if (ev.asistencia_guardada && isProfesor) {
+      req.flash('warning', 'La asistencia para esta evaluación ya fue guardada y no puede ser modificada por el profesor. Cualquier ajuste posterior corresponde a Inspectoría General.');
+      return res.redirect(`/evaluaciones/${evalId}`);
+    }
+
+    const alumnos = store.getAlumnosByCurso(ev.curso_id);
+
+    alumnos.forEach(alumno => {
+      const estadoEnviado = req.body[`estado_${alumno.id}`];
+      const motivo = req.body[`motivo_${alumno.id}`] || '';
+      const existing = store.getAsistencia(alumno.id, evalId);
+
+      // Si inspectoría está guardando y este alumno no vino en el formulario (por ejemplo si ya estaba presente)
+      if (isInspector && !estadoEnviado) {
+        return;
+      }
+
+      let estadoFinal = 'presente';
+      if (isInspector) {
+        // Inspectoría tiene atribución para justificar o registrar salida pedagógica / inasistencia
+        estadoFinal = estadoEnviado || (existing ? existing.estado_asistencia : 'injustificada');
+      } else {
+        // Si es Profesor: marca 'presente', 'injustificada' o 'salida' (salida pedagógica).
+        // Si el alumno ya contaba con 'justificado' médica por Inspectoría, se respeta
+        if (estadoEnviado === 'presente') {
+          estadoFinal = 'presente';
+        } else if (estadoEnviado === 'salida') {
+          estadoFinal = 'salida';
+        } else {
+          if (existing && existing.estado_asistencia === 'justificado') {
+            estadoFinal = 'justificado';
+          } else {
+            estadoFinal = 'injustificada';
+          }
+        }
+      }
+
+      const presente = (estadoFinal === 'presente');
+      const justificado = (estadoFinal === 'justificado' || estadoFinal === 'salida');
+
+      store.guardarAsistencia({
+        alumno_id: alumno.id,
+        evaluacion_id: evalId,
+        presente,
+        estado_asistencia: estadoFinal,
+        motivo: presente ? '' : motivo,
+        justificado
+      });
+
+      // Sincronizar automáticamente cualquier recuperación existente del alumno para esta prueba
+      const recExistente = store.recuperaciones.find(r => r.alumno_id === alumno.id && r.evaluacion_id === evalId);
+      if (recExistente) {
+        if (estadoFinal === 'justificado' || estadoFinal === 'salida') {
+          recExistente.porcentaje_exigencia = 60.0;
+          recExistente.tipo_justificacion = (estadoFinal === 'salida' ? 'salida_pedagogica' : 'medico');
+          if (motivo) {
+            recExistente.motivo = `[${estadoFinal === 'salida' ? 'Salida Pedagógica' : 'Certificado Médico'}] ${motivo}`;
+          }
+        } else if (estadoFinal === 'injustificada') {
+          recExistente.porcentaje_exigencia = 70.0;
+          recExistente.tipo_justificacion = 'injustificada';
+          if (motivo) {
+            recExistente.motivo = `[Injustificada] ${motivo}`;
+          }
+        }
+      }
+    });
+
+    // Marcar la evaluación como que ya tiene su asistencia oficial guardada
+    store.actualizarEvaluacion(evalId, { asistencia_guardada: true });
+
+    req.flash('success', isProfesor 
+      ? 'Asistencia guardada exitosamente. Ha quedado registrada y cerrada para el curso.' 
+      : 'Registro de asistencia e inasistencias actualizado correctamente.');
+    res.redirect(`/evaluaciones/${evalId}`);
+  } catch (err) {
+    console.error('Error procesando asistencia:', err);
+    req.flash('danger', 'Error al procesar la asistencia.');
+    res.redirect(`/evaluaciones/${req.params.id}`);
+  }
+});
+
+// -------------------------------------------------------------
+// ALUMNOS
+// -------------------------------------------------------------
+app.get('/alumnos', requireAuth, (req, res) => {
+  const { busqueda, curso_id } = req.query;
+  let list = store.alumnos.map(a => store.getAlumno(a.id));
+  let cursosList = store.cursos;
+
+  // Si el usuario es profesor, solo ve los cursos y alumnos a los que hace clases
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    const profObj = store.getProfesor(req.session.user.profesor_id);
+    if (profObj && profObj.cursos_asignados && profObj.cursos_asignados.length > 0) {
+      cursosList = store.cursos.filter(c => profObj.cursos_asignados.includes(c.id));
+      list = list.filter(a => profObj.cursos_asignados.includes(a.curso_id));
+    }
+  }
+
+  if (curso_id) {
+    list = list.filter(a => a.curso_id === Number(curso_id));
+  }
+
+  if (busqueda) {
+    const q = busqueda.toLowerCase().trim();
+    list = list.filter(a => 
+      a.nombre.toLowerCase().includes(q) ||
+      a.apellido.toLowerCase().includes(q) ||
+      a.rut.toLowerCase().includes(q)
+    );
+  }
+
+  res.render('alumnos/listar', {
+    title: 'Alumnos',
+    active: 'alumnos',
+    alumnos: list,
+    cursos: cursosList,
+    filtros: { busqueda, curso_id }
+  });
+});
+
+app.get('/alumnos/crear', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('alumnos/crear', {
+    title: 'Nuevo Alumno',
+    active: 'alumnos',
+    cursos: store.cursos
+  });
+});
+
+app.post('/alumnos/crear', requireAuth, requireRole('utp'), (req, res) => {
+  const { rut, nombre, apellido, curso_id } = req.body;
+  
+  const alumno = store.crearAlumno({
+    rut,
+    nombre,
+    apellido,
+    curso_id: Number(curso_id)
+  });
+
+  req.flash('success', `Alumno ${alumno.nombre} ${alumno.apellido} registrado exitosamente.`);
+  res.redirect(`/alumnos/${alumno.id}`);
+});
+
+app.get('/alumnos/:id', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const alumno = store.getAlumnoById(id);
+
+  if (!alumno) {
+    req.flash('danger', 'Alumno no encontrado.');
+    return res.redirect('/alumnos');
+  }
+
+  const evalsCurso = store.evaluaciones.filter(e => e.curso_id === alumno.curso_id);
+  const asistenciasList = store.getAsistenciasByAlumno(alumno.id);
+  
+  // Format items
+  const asistenciasConEval = asistenciasList.map(a => ({
+    asistencia: a,
+    evaluacion: store.getEvaluacionById(a.evaluacion_id) || {}
+  })).filter(item => item.evaluacion.id);
+
+  const ausencias = asistenciasList.filter(a => !a.presente);
+  const recuperaciones = store.getRecuperacionesByAlumno(alumno.id);
+
+  res.render('alumnos/perfil', {
+    title: alumno.nombre_completo,
+    active: 'alumnos',
+    alumno,
+    total_evals: evalsCurso.length,
+    total_ausencias: ausencias.length,
+    asistencias: asistenciasConEval,
+    recuperaciones
+  });
+});
+
+// -------------------------------------------------------------
+// RECUPERACIONES
+// -------------------------------------------------------------
+app.get('/recuperaciones', requireAuth, (req, res) => {
+  const { estado, tipo } = req.query;
+  let list = [...store.recuperaciones];
+
+  // Si el usuario es profesor, solo ve las recuperaciones de las asignaturas y cursos que le corresponden
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    list = store.getRecuperacionesByProfesor(req.session.user.profesor_id);
+  }
+
+  // Si el usuario es un alumno, solo ve sus propias recuperaciones
+  if (req.session.user.rol === 'alumno' && req.session.user.alumno_id) {
+    list = list.filter(r => r.alumno_id === req.session.user.alumno_id);
+  }
+
+  // Filtro por estado operativo de la prueba (usado principalmente por profesores y UTP)
+  if (estado) {
+    list = list.filter(r => r.estado === estado);
+  }
+
+  // Filtro por tipo de acreditación médica (usado principalmente por Inspectoría General)
+  if (tipo === 'pendientes_medico') {
+    list = list.filter(r => Number(r.porcentaje_exigencia) >= 70);
+  } else if (tipo === 'acreditadas') {
+    list = list.filter(r => Number(r.porcentaje_exigencia) < 70 && r.tipo_justificacion !== 'salida_pedagogica');
+  } else if (tipo === 'salida') {
+    list = list.filter(r => r.tipo_justificacion === 'salida_pedagogica');
+  }
+
+  // Enriquecer con objetos completos
+  list = list.map(r => ({
+    ...r,
+    alumno: store.getAlumnoById(r.alumno_id),
+    evaluacion: store.getEvaluacionById(r.evaluacion_id)
+  }));
+
+  res.render('recuperaciones/listar', {
+    title: 'Recuperaciones',
+    active: 'recuperaciones',
+    recuperaciones: list,
+    filtros: { estado, tipo }
+  });
+});
+
+app.get('/recuperaciones/crear', requireAuth, (req, res) => {
+  if (req.session.user.rol === 'utp') {
+    req.flash('warning', 'La asignación de recuperaciones corresponde a los Profesores. El perfil UTP cumple labores de supervisión y reportería.');
+    return res.redirect('/recuperaciones');
+  }
+  if (req.session.user.rol === 'inspe') {
+    req.flash('warning', 'La programación de fechas y contenidos de recuperaciones corresponde al Profesor de la asignatura. La tarea de Inspectoría es acreditar certificados médicos.');
+    return res.redirect('/recuperaciones');
+  }
+  if (req.session.user.rol !== 'profe') {
+    req.flash('danger', 'Solo los profesores de asignatura tienen permisos para agendar recuperaciones.');
+    return res.redirect('/recuperaciones');
+  }
+
+  const hoy = new Date().toISOString().split('T')[0];
+  const alumnoId = req.query.alumno_id ? Number(req.query.alumno_id) : null;
+  const evalId = req.query.evaluacion_id ? Number(req.query.evaluacion_id) : null;
+
+  // Enrich evaluations and students with related models
+  let enrichedEvals = store.evaluaciones.map(e => store.enrichEvaluacion(e));
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    enrichedEvals = enrichedEvals.filter(e => e.profesor_id === req.session.user.profesor_id);
+  }
+  const enrichedAlumnos = store.alumnos.map(a => store.getAlumno(a.id));
+
+  res.render('recuperaciones/crear', {
+    title: 'Programar Recuperación',
+    active: 'recuperaciones',
+    evaluaciones: enrichedEvals,
+    alumnos: enrichedAlumnos,
+    alumno_id_preselect: alumnoId,
+    evaluacion_id_preselect: evalId,
+    hoy
+  });
+});
+
+app.post('/recuperaciones/crear', requireAuth, requireRole('profe'), (req, res) => {
+  const { evaluacion_id, alumno_id, fecha_recuperacion, hora_recuperacion, indicaciones } = req.body;
+  const aId = Number(alumno_id);
+  const eId = Number(evaluacion_id);
+
+  if (!evaluacion_id || !alumno_id || !fecha_recuperacion) {
+    req.flash('danger', 'Debes seleccionar la evaluación original, el alumno ausente y la fecha de citación.');
+    return res.redirect('/recuperaciones/crear');
+  }
+
+  // Regla Institucional Liceo:
+  // El profesor simplemente genera la prueba recuperativa para el estudiante ausente.
+  // Por defecto, se crea con exigencia 70% (inasistencia pendiente de acreditar).
+  // Si el estudiante presenta certificado médico ante Inspectoría General, Inspectoría
+  // lo acreditará en el sistema y se rebajará automáticamente al 60% regular.
+  const asistPrevia = store.getAsistencia(aId, eId);
+  let porcentaje = 70.0;
+  let justificado = false;
+  let tipo_justificacion = 'injustificada';
+  let motivo = indicaciones ? `[Citación Recuperativa - 70% Exigencia inicial] ${indicaciones}` : 'Inasistencia pendiente de justificar ante Inspectoría (70% exigencia inicial)';
+
+  // Si Inspectoría General ya había acreditado un certificado médico o salida pedagógica para esta inasistencia:
+  if (asistPrevia && (asistPrevia.justificado || asistPrevia.estado_asistencia === 'justificado' || asistPrevia.estado_asistencia === 'salida')) {
+    porcentaje = 60.0;
+    justificado = true;
+    tipo_justificacion = asistPrevia.estado_asistencia === 'salida' ? 'salida_pedagogica' : 'medico';
+    motivo = asistPrevia.motivo || '[Certificado Médico Acreditado en Inspectoría]';
+    if (indicaciones) motivo += ` • Indicaciones del docente: ${indicaciones}`;
+  } else {
+    // Registrar o actualizar inasistencia de la evaluación
+    store.guardarAsistencia({
+      alumno_id: aId,
+      evaluacion_id: eId,
+      presente: false,
+      motivo,
+      justificado: false,
+      estado_asistencia: 'injustificada'
+    });
+  }
+
+  store.crearRecuperacion({
+    evaluacion_id: eId,
+    alumno_id: aId,
+    fecha_recuperacion,
+    hora_recuperacion: hora_recuperacion || '',
+    porcentaje_exigencia: porcentaje,
+    tipo_justificacion,
+    motivo
+  });
+
+  const al = store.getAlumnoById(aId);
+  const nombreAl = al ? al.nombre_completo : 'el estudiante';
+  if (porcentaje === 60.0) {
+    req.flash('success', `Evaluación recuperativa programada para ${nombreAl} al 60% de exigencia (certificado médico ya acreditado en Inspectoría).`);
+  } else {
+    req.flash('success', `Evaluación recuperativa programada para ${nombreAl} al 70% de exigencia inicial. Se rebajará automáticamente al 60% cuando Inspectoría General acredite el certificado médico.`);
+  }
+  res.redirect('/recuperaciones');
+});
+
+app.post('/recuperaciones/:id/completar', requireAuth, requireRole('profe'), (req, res) => {
+  const id = Number(req.params.id);
+  const r = store.actualizarEstadoRecuperacion(id, 'completada');
+  const al = r && r.alumno ? r.alumno.nombre_completo : 'El estudiante';
+  req.flash('success', `Evaluación recuperativa rendida y completada con éxito por ${al}.`);
+  res.redirect(req.get('Referrer') || '/recuperaciones');
+});
+
+// Registrar inasistencia definitiva a la prueba recuperativa (Aplica nota 1.1)
+app.post('/recuperaciones/:id/no-presento', requireAuth, requireRole('profe'), (req, res) => {
+  const id = Number(req.params.id);
+  const r = store.actualizarEstadoRecuperacion(id, 'no_presento');
+  if (r) {
+    r.observacion_cierre = 'Estudiante no se presentó a rendir la evaluación recuperativa. Se aplica calificación mínima reglamentaria 1.1 según manual institucional.';
+  }
+  const al = r && r.alumno ? r.alumno.nombre_completo : 'El estudiante';
+  req.flash('warning', `Recuperación cerrada: ${al} no se presentó a rendir la prueba. Se registra nota mínima 1.1.`);
+  res.redirect(req.get('Referrer') || '/recuperaciones');
+});
+
+// Inspectoría acredita certificado médico y rebaja exigencia de 70% a 60%
+app.post('/recuperaciones/:id/justificar-medico', requireAuth, requireRole('inspe'), (req, res) => {
+  const id = Number(req.params.id);
+  const { folio, diagnostico } = req.body;
+  const rec = store.recuperaciones.find(r => r.id === id);
+
+  if (!rec) {
+    req.flash('danger', 'Recuperación no encontrada.');
+    return res.redirect('/recuperaciones');
+  }
+
+  const detalleMotivo = `[Certificado Médico] Folio ${folio || 'S/N'}${diagnostico ? ' - ' + diagnostico : ''} (Acreditado por Inspectoría General)`;
+  
+  // Rebajar exigencia automáticamente al 60%
+  rec.porcentaje_exigencia = 60.0;
+  rec.tipo_justificacion = 'medico';
+  rec.motivo = detalleMotivo;
+
+  // Sincronizar asistencia de la evaluación
+  const asist = store.getAsistencia(rec.alumno_id, rec.evaluacion_id);
+  if (asist) {
+    asist.justificado = true;
+    asist.estado_asistencia = 'justificado';
+    asist.motivo = detalleMotivo;
+  }
+
+  const al = store.getAlumnoById(rec.alumno_id);
+  req.flash('success', `Certificado médico folio ${folio || 'S/N'} acreditado para ${al ? al.nombre_completo : 'el alumno'}. La exigencia se rebajó automáticamente del 70% al 60%.`);
+  res.redirect(req.get('Referrer') || '/recuperaciones');
+});
+
+app.post('/recuperaciones/:id/cancelar', requireAuth, requireRole('profe'), (req, res) => {
+  const id = Number(req.params.id);
+  store.actualizarEstadoRecuperacion(id, 'cancelada');
+  req.flash('info', 'Recuperación cancelada.');
+  res.redirect(req.get('Referrer') || '/recuperaciones');
+});
+
+// -------------------------------------------------------------
+// REPORTES
+// -------------------------------------------------------------
+app.get('/reportes/calendario', requireAuth, (req, res) => {
+  const now = new Date();
+  const anio = req.query.anio ? parseInt(req.query.anio) : now.getFullYear();
+  const mes = req.query.mes ? parseInt(req.query.mes) : now.getMonth() + 1;
+  let curso_id = req.query.curso_id ? Number(req.query.curso_id) : null;
+
+  // Si el usuario es alumno y no especificó curso, auto-asignar su curso
+  if (req.session.user.rol === 'alumno' && !curso_id) {
+    const alumnoObj = req.session.user.alumno_id ? store.getAlumnoById(req.session.user.alumno_id) : null;
+    if (alumnoObj && alumnoObj.curso_id) {
+      curso_id = alumnoObj.curso_id;
+    }
+  }
+
+  const mesesNombres = [
+    'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+    'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+  ];
+
+  const mesesList = mesesNombres.map((m, i) => ({ num: i + 1, nombre: m }));
+
+  // Lista completa de cursos y profesores
+  const cursosCalendario = store.cursos;
+  const profesoresList = store.profesores.map(p => ({
+    id: p.id,
+    nombre: p.nombre_completo,
+    materia: p.materia
+  }));
+
+  const profObj = (req.session.user.rol === 'profe' && req.session.user.profesor_id) ? store.getProfesor(req.session.user.profesor_id) : null;
+  const currentProfId = profObj ? profObj.id : null;
+  const misCursosIds = profObj && profObj.cursos_asignados ? profObj.cursos_asignados : [];
+
+  // Filtros adicionales: profesor específico o switch "Sólo mis pruebas"
+  let profesor_id = req.query.profesor_id ? Number(req.query.profesor_id) : null;
+  const solo_mis_pruebas = req.query.mis_pruebas === '1';
+  if (solo_mis_pruebas && currentProfId) {
+    profesor_id = currentProfId;
+  }
+
+  // Enriquecer todas las evaluaciones (incluyendo indicador si fue creada por el usuario actual)
+  const todasEvals = store.evaluaciones.map(e => {
+    const enriched = store.enrichEvaluacion(e);
+    return {
+      ...enriched,
+      es_mia: currentProfId ? (e.profesor_id === currentProfId) : false
+    };
+  });
+
+  // Filtrar evaluaciones del mes y año (visibles todas las de Marcela, Antonio, etc. para el curso)
+  let evals = todasEvals.filter(e => {
+    if (!e.fecha) return false;
+    const parts = e.fecha.split('-');
+    const matchYearMonth = parseInt(parts[0], 10) === anio && parseInt(parts[1], 10) === mes;
+    if (!matchYearMonth) return false;
+    if (curso_id && e.curso_id !== curso_id) return false;
+    if (profesor_id && e.profesor_id !== profesor_id) return false;
+    return true;
+  });
+
+  // Enriquecer y filtrar recuperaciones del mes y año
+  const todasRecups = store.recuperaciones.map(r => {
+    const enriched = store.enrichRecuperacion(r);
+    const evalProfId = enriched.evaluacion ? enriched.evaluacion.profesor_id : null;
+    return {
+      ...enriched,
+      es_mia: currentProfId ? (evalProfId === currentProfId) : false
+    };
+  });
+
+  let recups = todasRecups.filter(r => {
+    if (!r.fecha_recuperacion) return false;
+    const parts = r.fecha_recuperacion.split('-');
+    const matchYearMonth = parseInt(parts[0], 10) === anio && parseInt(parts[1], 10) === mes;
+    if (!matchYearMonth) return false;
+    if (curso_id) {
+      const evalCursoId = r.evaluacion ? r.evaluacion.curso_id : (r.alumno ? r.alumno.curso_id : null);
+      if (evalCursoId !== curso_id) return false;
+    }
+    if (profesor_id) {
+      const evalProfId = r.evaluacion ? r.evaluacion.profesor_id : null;
+      if (evalProfId !== profesor_id) return false;
+    }
+    if (req.session.user.rol === 'alumno' && req.session.user.alumno_id) {
+      return r.alumno_id === req.session.user.alumno_id;
+    }
+    return true;
+  });
+
+  // Agrupar evaluaciones por día
+  const evalsPorDia = {};
+  evals.forEach(e => {
+    const dia = parseInt(e.fecha.split('-')[2], 10);
+    if (!evalsPorDia[dia]) evalsPorDia[dia] = [];
+    evalsPorDia[dia].push(e);
+  });
+
+  // Agrupar recuperaciones por día
+  const recupsPorDia = {};
+  recups.forEach(r => {
+    const dia = parseInt(r.fecha_recuperacion.split('-')[2], 10);
+    if (!recupsPorDia[dia]) recupsPorDia[dia] = [];
+    recupsPorDia[dia].push(r);
+  });
+
+  // Matriz de semanas (Lunes a Domingo)
+  const primerDia = new Date(anio, mes - 1, 1);
+  const ultimoDia = new Date(anio, mes, 0);
+  const diasEnMes = ultimoDia.getDate();
+
+  let diaSemanaInicio = (primerDia.getDay() + 6) % 7;
+
+  const semanas = [];
+  let semanaActual = new Array(diaSemanaInicio).fill(0);
+
+  for (let d = 1; d <= diasEnMes; d++) {
+    semanaActual.push(d);
+    if (semanaActual.length === 7) {
+      semanas.push(semanaActual);
+      semanaActual = [];
+    }
+  }
+
+  if (semanaActual.length > 0) {
+    while (semanaActual.length < 7) {
+      semanaActual.push(0);
+    }
+    semanas.push(semanaActual);
+  }
+
+  res.render('reportes/calendario', {
+    title: 'Calendario de Evaluaciones',
+    active: 'calendario',
+    mes,
+    anio,
+    mes_nombre: mesesNombres[mes - 1],
+    meses: mesesList,
+    semanas,
+    evals_por_dia: evalsPorDia,
+    recups_por_dia: recupsPorDia,
+    total_evals_mes: evals.length,
+    total_recups_mes: recups.length,
+    cursos: cursosCalendario,
+    profesores: profesoresList,
+    filtros: { curso_id, profesor_id, solo_mis_pruebas },
+    mis_cursos_ids: misCursosIds,
+    es_profe: req.session.user.rol === 'profe',
+    current_prof_id: currentProfId,
+    today_day: now.getDate(),
+    today_month: now.getMonth() + 1,
+    today_year: now.getFullYear()
+  });
+});
+
+app.get('/reportes/pendientes', requireAuth, (req, res) => {
+  let pendientes = store.recuperaciones.filter(r => r.estado === 'pendiente');
+
+  // Si es profesor, solo ve pendientes de sus módulos/evaluaciones
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    pendientes = store.getRecuperacionesByProfesor(req.session.user.profesor_id).filter(r => r.estado === 'pendiente');
+  }
+
+  // Group by evaluation id
+  const agrupadas = {};
+  pendientes.forEach(r => {
+    if (!agrupadas[r.evaluacion_id]) agrupadas[r.evaluacion_id] = [];
+    agrupadas[r.evaluacion_id].push({
+      ...r,
+      alumno: store.getAlumnoById(r.alumno_id),
+      evaluacion: store.getEvaluacionById(r.evaluacion_id)
+    });
+  });
+
+  res.render('reportes/pendientes', {
+    title: 'Alumnos Pendientes de Recuperación',
+    active: 'pendientes',
+    alumnos_por_eval: agrupadas
+  });
+});
+
+app.get('/reportes/carga', requireAuth, (req, res) => {
+  const now = new Date();
+  const anio = req.query.anio ? parseInt(req.query.anio, 10) : now.getFullYear();
+  const mes = req.query.mes ? parseInt(req.query.mes, 10) : now.getMonth() + 1;
+  const mesesNombres = [
+    'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+    'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+  ];
+
+  const meses = mesesNombres.map((nombre, idx) => ({
+    num: idx + 1,
+    nombre
+  }));
+
+  // Carga global del curso: Para que la carga académica tenga sentido real y pedagógico,
+  // se deben contabilizar TODAS las evaluaciones que tienen los estudiantes de ese curso
+  // programadas por TODOS los profesores en el período.
+  let cursosCarga = store.cursos;
+  const evalsBase = store.evaluaciones;
+
+  // Si el usuario es profesor, opcionalmente puede alternar entre ver todos o sólo sus cursos asignados
+  const soloMisCursos = req.query.mis_cursos === '1';
+  let profObj = null;
+  if (req.session.user.rol === 'profe' && req.session.user.profesor_id) {
+    profObj = store.getProfesor(req.session.user.profesor_id);
+    if (soloMisCursos && profObj && profObj.cursos_asignados && profObj.cursos_asignados.length > 0) {
+      cursosCarga = store.cursos.filter(c => profObj.cursos_asignados.includes(c.id));
+    }
+  }
+
+  const datosCurso = cursosCarga.map(c => {
+    // Todas las evaluaciones del curso en este año y mes (de todas las asignaturas)
+    const evalsCursoMes = evalsBase.filter(e => {
+      if (e.curso_id !== c.id) return false;
+      const parts = e.fecha.split('-');
+      return parseInt(parts[0], 10) === anio && parseInt(parts[1], 10) === mes;
+    });
+
+    // Agrupar por fecha para detectar días con límite diario alcanzado (Tope 2 de 2 del Liceo)
+    const porFecha = {};
+    evalsCursoMes.forEach(e => {
+      if (!porFecha[e.fecha]) porFecha[e.fecha] = [];
+      porFecha[e.fecha].push(e);
+    });
+
+    const diasSaturados = []; // Días con 2 evaluaciones (Tope diario máximo alcanzado: 2/2)
+    const diasParciales = []; // Días con 1 evaluación (1 cupo restante)
+
+    Object.keys(porFecha).sort().forEach(fecha => {
+      const count = porFecha[fecha].length;
+      if (count >= 2) {
+        diasSaturados.push({
+          fecha,
+          count,
+          evaluaciones: porFecha[fecha]
+        });
+      } else if (count === 1) {
+        diasParciales.push({
+          fecha,
+          count,
+          evaluaciones: porFecha[fecha]
+        });
+      }
+    });
+
+    // Enriquecer detalle de evaluaciones con asignatura y profesor
+    const evalsDetalle = evalsCursoMes.map(e => {
+      const asig = store.getAsignatura(e.asignatura_id);
+      const prof = store.getProfesor(e.profesor_id);
+      const cuposOcupadosDia = porFecha[e.fecha] ? porFecha[e.fecha].length : 1;
+      return {
+        ...e,
+        asignatura: asig || { nombre: 'Asignatura', color: '#14213D' },
+        profesor: prof || { nombre_completo: 'Profesor' },
+        cuposOcupadosDia,
+        diaSaturado: cuposOcupadosDia >= 2
+      };
+    }).sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+    // Determinar nivel de carga del curso:
+    // - Alta carga: Si tiene días con tope diario copado (2/2) O si acumula 6 o más evaluaciones en el mes
+    // - Media: Si acumula 4 o 5 evaluaciones en el mes
+    // - Normal: Menos de 4 evaluaciones y sin días saturados
+    let cargaNivel = 'normal';
+    let cargaRazon = 'Carga equilibrada y sin días saturados';
+
+    if (diasSaturados.length > 0 && evalsCursoMes.length >= 6) {
+      cargaNivel = 'alta';
+      cargaRazon = `${diasSaturados.length} día(s) con tope diario completo (2/2 cupos agotados) y ${evalsCursoMes.length} evaluaciones mensuales`;
+    } else if (diasSaturados.length > 0) {
+      cargaNivel = 'alta';
+      cargaRazon = `${diasSaturados.length} día(s) con tope diario completo (2/2 cupos agotados)`;
+    } else if (evalsCursoMes.length >= 6) {
+      cargaNivel = 'alta';
+      cargaRazon = `${evalsCursoMes.length} evaluaciones en el mes (distribuidas en distintos días)`;
+    } else if (evalsCursoMes.length >= 4) {
+      cargaNivel = 'media';
+      cargaRazon = `${evalsCursoMes.length} evaluaciones en el mes (carga moderada)`;
+    } else if (evalsCursoMes.length > 0) {
+      cargaNivel = 'normal';
+      cargaRazon = `${evalsCursoMes.length} evaluación(es) en el mes`;
+    } else {
+      cargaNivel = 'normal';
+      cargaRazon = 'Sin evaluaciones calendarizadas este mes';
+    }
+
+    const alumnosCount = store.getAlumnosByCurso(c.id).length;
+
+    return {
+      curso: c,
+      evals_mes: evalsCursoMes.length,
+      alumnos: alumnosCount,
+      dias_saturados: diasSaturados,
+      dias_parciales: diasParciales,
+      carga_nivel: cargaNivel,
+      carga_razon: cargaRazon,
+      evaluaciones: evalsDetalle
+    };
+  });
+
+  const totalEvals = datosCurso.reduce((a, b) => a + b.evals_mes, 0);
+  const maxEvals = Math.max(...datosCurso.map(d => d.evals_mes), 1);
+  const cursosAltaCarga = datosCurso.filter(d => d.carga_nivel === 'alta').length;
+  const cursosMediaCarga = datosCurso.filter(d => d.carga_nivel === 'media').length;
+  const cursosNormalCarga = datosCurso.filter(d => d.carga_nivel === 'normal').length;
+  const totalDiasSaturados = datosCurso.reduce((sum, d) => sum + d.dias_saturados.length, 0);
+
+  res.render('reportes/carga', {
+    title: 'Carga Académica',
+    active: 'carga',
+    mes_nombre: mesesNombres[mes - 1],
+    mes,
+    anio,
+    meses,
+    solo_mis_cursos: soloMisCursos,
+    prof_obj: profObj,
+    datos_curso: datosCurso,
+    total_evals: totalEvals,
+    max_evals: maxEvals,
+    cursos_alta_carga: cursosAltaCarga,
+    cursos_media_carga: cursosMediaCarga,
+    cursos_normal_carga: cursosNormalCarga,
+    total_dias_saturados: totalDiasSaturados
+  });
+});
+
+// -------------------------------------------------------------
+// ADMIN (UTP ONLY)
+// -------------------------------------------------------------
+app.get('/admin', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('admin/index', {
+    title: 'Configuración',
+    active: 'admin',
+    cursos: store.cursos,
+    asignaturas: store.asignaturas,
+    profesores: store.profesores,
+    usuarios: store.usuarios
+  });
+});
+
+// Admin: Cursos
+app.get('/admin/cursos', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('admin/cursos', {
+    title: 'Cursos',
+    active: 'admin',
+    data: store.cursos
+  });
+});
+
+app.post('/admin/cursos', requireAuth, requireRole('utp'), (req, res) => {
+  const { nombre, nivel } = req.body;
+  store.crearCurso({ nombre, nivel });
+  req.flash('success', `Curso ${nombre} registrado.`);
+  res.redirect('/admin/cursos');
+});
+
+app.post('/admin/cursos/:id/eliminar', requireAuth, requireRole('utp'), (req, res) => {
+  store.eliminarCurso(Number(req.params.id));
+  req.flash('info', 'Curso eliminado.');
+  res.redirect('/admin/cursos');
+});
+
+// Admin: Asignaturas
+app.get('/admin/asignaturas', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('admin/asignaturas', {
+    title: 'Asignaturas',
+    active: 'admin',
+    data: store.asignaturas
+  });
+});
+
+app.post('/admin/asignaturas', requireAuth, requireRole('utp'), (req, res) => {
+  const { nombre, color } = req.body;
+  store.crearAsignatura({ nombre, color });
+  req.flash('success', `Asignatura ${nombre} registrada.`);
+  res.redirect('/admin/asignaturas');
+});
+
+app.post('/admin/asignaturas/:id/eliminar', requireAuth, requireRole('utp'), (req, res) => {
+  store.eliminarAsignatura(Number(req.params.id));
+  req.flash('info', 'Asignatura eliminada.');
+  res.redirect('/admin/asignaturas');
+});
+
+// Admin: Profesores
+app.get('/admin/profesores', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('admin/profesores', {
+    title: 'Profesores',
+    active: 'admin',
+    data: store.profesores,
+    cursos: store.cursos,
+    asignaturas: store.asignaturas
+  });
+});
+
+app.post('/admin/profesores', requireAuth, requireRole('utp'), (req, res) => {
+  const { nombre, apellido, email } = req.body;
+  store.crearProfesor({ nombre, apellido, email });
+  req.flash('success', `Profesor ${nombre} ${apellido} registrado.`);
+  res.redirect('/admin/profesores');
+});
+
+app.post('/admin/profesores/:id/eliminar', requireAuth, requireRole('utp'), (req, res) => {
+  store.eliminarProfesor(Number(req.params.id));
+  req.flash('info', 'Profesor eliminado.');
+  res.redirect('/admin/profesores');
+});
+
+// Admin: Usuarios
+app.get('/admin/usuarios', requireAuth, requireRole('utp'), (req, res) => {
+  res.render('admin/usuarios', {
+    title: 'Usuarios',
+    active: 'admin',
+    data: store.usuarios,
+    roles: {
+      utp: 'UTP / Directivo',
+      profe: 'Profesor',
+      inspe: 'Inspectoría',
+      alumno: 'Alumno'
+    }
+  });
+});
+
+app.post('/admin/usuarios', requireAuth, requireRole('utp'), (req, res) => {
+  const { rut, correo, password, nombre, rol } = req.body;
+  store.crearUsuario({
+    rut,
+    correo,
+    password_hash: password,
+    nombre,
+    rol
+  });
+  req.flash('success', `Usuario ${correo} creado.`);
+  res.redirect('/admin/usuarios');
+});
+
+app.post('/admin/usuarios/:rut/toggle', requireAuth, requireRole('utp'), (req, res) => {
+  const rut = decodeURIComponent(req.params.rut);
+  const u = store.usuarios.find(user => user.rut === rut);
+  if (u) {
+    u.activo = !u.activo;
+    req.flash('info', `Estado de usuario actualizado: ${u.activo ? 'Activo' : 'Inactivo'}`);
+  }
+  res.redirect('/admin/usuarios');
+});
+
+app.post('/admin/usuarios/:rut/eliminar', requireAuth, requireRole('utp'), (req, res) => {
+  const rut = decodeURIComponent(req.params.rut);
+  store.eliminarUsuario(rut);
+  req.flash('info', 'Usuario eliminado.');
+  res.redirect('/admin/usuarios');
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).send('Página no encontrada en AgendEx');
+});
+
+// Start Server on 0.0.0.0:3000
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`AgendEx servidor iniciado en http://0.0.0.0:${PORT}`);
+});
